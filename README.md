@@ -6,7 +6,7 @@
 
 Ferramenta CLI profissional para arquivamento automático de logs em formato tar.gz com timestamp. Ideal para manter o sistema organizado, removendo logs antigos enquanto preserva-os compactados para referência futura.
 
-> 🗺️ **Projeto baseado em**: [roadmap.sh - Log Archive Tool](https://roadmap.sh/projects/log-archive)
+> 🗺️ **Projeto baseado em**: [roadmap.sh - Log Archive Tool](https://roadmap.sh/projects/log-archive-tool)
 
 ## ✨ Características
 
