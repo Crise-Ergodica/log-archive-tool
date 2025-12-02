@@ -1,0 +1,415 @@
+#!/usr/bin/env bash
+
+################################################################################
+# Log Archive Tool
+# 
+# Description: Compresses and archives log files from a specified directory
+#              into timestamped tar.gz archives.
+#
+# Usage: log-archive <log-directory> [options]
+#
+# Author: Aurora Ergodica
+# License: MIT
+# Version: 1.0.0
+################################################################################
+
+set -euo pipefail  # Exit on error, undefined variables, and pipe failures
+
+# Color codes for output
+readonly RED='\033[0;31m'
+readonly GREEN='\033[0;32m'
+readonly YELLOW='\033[1;33m'
+readonly BLUE='\033[0;34m'
+readonly CYAN='\033[0;36m'
+readonly NC='\033[0m' # No Color
+
+# Default configuration
+readonly SCRIPT_VERSION="1.0.0"
+readonly ARCHIVE_DIR="${HOME}/log_archives"
+readonly LOG_FILE="${ARCHIVE_DIR}/archive_history.log"
+
+# Global variables
+VERBOSE=false
+DRY_RUN=false
+KEEP_ORIGINALS=false
+EXCLUDE_PATTERNS=()
+MAX_AGE_DAYS=""
+
+################################################################################
+# Helper Functions
+################################################################################
+
+# Print colored output
+print_color() {
+    local color=$1
+    shift
+    echo -e "${color}$*${NC}"
+}
+
+# Print error message and exit
+error_exit() {
+    print_color "$RED" "ERROR: $*" >&2
+    exit 1
+}
+
+# Print warning message
+warn() {
+    print_color "$YELLOW" "WARNING: $*" >&2
+}
+
+# Print info message
+info() {
+    print_color "$CYAN" "INFO: $*"
+}
+
+# Print success message
+success() {
+    print_color "$GREEN" "SUCCESS: $*"
+}
+
+# Print verbose message
+verbose() {
+    if [[ "$VERBOSE" == true ]]; then
+        print_color "$BLUE" "[VERBOSE] $*"
+    fi
+}
+
+# Log to file
+log_to_file() {
+    local timestamp
+    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "[$timestamp] $*" >> "$LOG_FILE"
+}
+
+# Display help message
+show_help() {
+    cat << EOF
+${GREEN}Log Archive Tool v${SCRIPT_VERSION}${NC}
+
+Compresses and archives log files from a specified directory.
+
+${CYAN}USAGE:${NC}
+    log-archive <log-directory> [options]
+
+${CYAN}ARGUMENTS:${NC}
+    <log-directory>    Path to the directory containing logs to archive
+
+${CYAN}OPTIONS:${NC}
+    -o, --output DIR       Output directory for archives (default: ~/log_archives)
+    -k, --keep            Keep original log files after archiving
+    -d, --dry-run         Show what would be archived without doing it
+    -v, --verbose         Enable verbose output
+    -e, --exclude PATTERN Exclude files matching pattern (can be used multiple times)
+    -a, --age DAYS        Only archive logs older than DAYS days
+    -h, --help            Display this help message
+    --version             Display version information
+
+${CYAN}EXAMPLES:${NC}
+    # Archive logs from /var/log
+    log-archive /var/log
+
+    # Archive with custom output directory
+    log-archive /var/log -o /backup/logs
+
+    # Dry run to see what would be archived
+    log-archive /var/log --dry-run
+
+    # Archive logs older than 7 days, excluding *.tmp files
+    log-archive /var/log --age 7 --exclude '*.tmp'
+
+    # Keep original files and verbose output
+    log-archive /var/log --keep --verbose
+
+${CYAN}OUTPUT:${NC}
+    Archives are named: logs_archive_YYYYMMDD_HHMMSS.tar.gz
+    Archive history is logged to: ${LOG_FILE}
+
+EOF
+}
+
+# Display version
+show_version() {
+    echo "Log Archive Tool v${SCRIPT_VERSION}"
+    echo "Copyright (c) 2025 Aurora Ergodica"
+    echo "License: MIT"
+}
+
+################################################################################
+# Core Functions
+################################################################################
+
+# Check if directory exists and is readable
+validate_directory() {
+    local dir=$1
+    
+    if [[ ! -d "$dir" ]]; then
+        error_exit "Directory does not exist: $dir"
+    fi
+    
+    if [[ ! -r "$dir" ]]; then
+        error_exit "Directory is not readable: $dir"
+    fi
+    
+    verbose "Directory validated: $dir"
+}
+
+# Create archive directory if it doesn't exist
+setup_archive_directory() {
+    local archive_dir=$1
+    
+    if [[ ! -d "$archive_dir" ]]; then
+        verbose "Creating archive directory: $archive_dir"
+        mkdir -p "$archive_dir" || error_exit "Failed to create archive directory: $archive_dir"
+    fi
+    
+    # Create log file if it doesn't exist
+    if [[ ! -f "$LOG_FILE" ]]; then
+        touch "$LOG_FILE" || error_exit "Failed to create log file: $LOG_FILE"
+    fi
+    
+    verbose "Archive directory ready: $archive_dir"
+}
+
+# Get list of files to archive
+get_files_to_archive() {
+    local log_dir=$1
+    local files=()
+    
+    # Find all log files
+    while IFS= read -r -d '' file; do
+        local skip=false
+        
+        # Check exclude patterns
+        for pattern in "${EXCLUDE_PATTERNS[@]}"; do
+            if [[ -n "$pattern" ]] && [[ "$file" == $pattern ]]; then
+                verbose "Excluding file (pattern match): $file"
+                skip=true
+                break
+            fi
+        done
+        
+        # Check age if specified
+        if [[ -n "$MAX_AGE_DAYS" ]] && [[ "$skip" == false ]]; then
+            local file_age_days
+            file_age_days=$(( ($(date +%s) - $(stat -c %Y "$file" 2>/dev/null || stat -f %m "$file" 2>/dev/null)) / 86400 ))
+            if [[ $file_age_days -lt $MAX_AGE_DAYS ]]; then
+                verbose "Excluding file (too recent): $file (age: ${file_age_days} days)"
+                skip=true
+            fi
+        fi
+        
+        if [[ "$skip" == false ]]; then
+            files+=("$file")
+        fi
+    done < <(find "$log_dir" -type f -print0)
+    
+    printf '%s\0' "${files[@]}"
+}
+
+# Calculate total size of files
+calculate_total_size() {
+    local total_size=0
+    
+    while IFS= read -r -d '' file; do
+        if [[ -f "$file" ]]; then
+            local size
+            size=$(stat -c %s "$file" 2>/dev/null || stat -f %z "$file" 2>/dev/null)
+            total_size=$((total_size + size))
+        fi
+    done
+    
+    echo "$total_size"
+}
+
+# Format bytes to human readable
+format_bytes() {
+    local bytes=$1
+    local units=("B" "KB" "MB" "GB" "TB")
+    local unit=0
+    local size=$bytes
+    
+    while (( size > 1024 && unit < 4 )); do
+        size=$((size / 1024))
+        unit=$((unit + 1))
+    done
+    
+    echo "${size} ${units[$unit]}"
+}
+
+# Create archive
+create_archive() {
+    local log_dir=$1
+    local archive_dir=$2
+    local timestamp
+    timestamp=$(date '+%Y%m%d_%H%M%S')
+    local archive_name="logs_archive_${timestamp}.tar.gz"
+    local archive_path="${archive_dir}/${archive_name}"
+    
+    info "Creating archive: $archive_name"
+    
+    # Get files to archive
+    local files=()
+    while IFS= read -r -d '' file; do
+        files+=("$file")
+    done < <(get_files_to_archive "$log_dir")
+    
+    if [[ ${#files[@]} -eq 0 ]]; then
+        warn "No files found to archive in: $log_dir"
+        return 1
+    fi
+    
+    info "Found ${#files[@]} file(s) to archive"
+    
+    # Calculate total size
+    local total_size
+    total_size=$(printf '%s\0' "${files[@]}" | calculate_total_size)
+    local human_size
+    human_size=$(format_bytes "$total_size")
+    info "Total size: $human_size"
+    
+    if [[ "$DRY_RUN" == true ]]; then
+        info "[DRY RUN] Would create archive: $archive_path"
+        info "[DRY RUN] Files to be archived:"
+        for file in "${files[@]}"; do
+            echo "  - $file"
+        done
+        return 0
+    fi
+    
+    # Create tar.gz archive
+    verbose "Compressing files..."
+    if tar -czf "$archive_path" -C / "${files[@]#/}" 2>/dev/null; then
+        local archive_size
+        archive_size=$(stat -c %s "$archive_path" 2>/dev/null || stat -f %z "$archive_path" 2>/dev/null)
+        local human_archive_size
+        human_archive_size=$(format_bytes "$archive_size")
+        
+        success "Archive created: $archive_path"
+        info "Archive size: $human_archive_size"
+        
+        # Calculate compression ratio
+        local ratio
+        ratio=$((100 - (archive_size * 100 / total_size)))
+        info "Compression ratio: ${ratio}%"
+        
+        # Log to file
+        log_to_file "Archive created: $archive_name | Files: ${#files[@]} | Original: $human_size | Compressed: $human_archive_size | Ratio: ${ratio}%"
+        
+        # Remove original files if not keeping them
+        if [[ "$KEEP_ORIGINALS" == false ]]; then
+            info "Removing original log files..."
+            for file in "${files[@]}"; do
+                if rm -f "$file"; then
+                    verbose "Removed: $file"
+                else
+                    warn "Failed to remove: $file"
+                fi
+            done
+            success "Original files removed"
+        else
+            info "Original files kept (--keep flag used)"
+        fi
+        
+        return 0
+    else
+        error_exit "Failed to create archive: $archive_path"
+    fi
+}
+
+################################################################################
+# Main Function
+################################################################################
+
+main() {
+    local log_directory=""
+    local output_directory="$ARCHIVE_DIR"
+    
+    # Parse command line arguments
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -h|--help)
+                show_help
+                exit 0
+                ;;
+            --version)
+                show_version
+                exit 0
+                ;;
+            -o|--output)
+                output_directory="$2"
+                shift 2
+                ;;
+            -k|--keep)
+                KEEP_ORIGINALS=true
+                shift
+                ;;
+            -d|--dry-run)
+                DRY_RUN=true
+                shift
+                ;;
+            -v|--verbose)
+                VERBOSE=true
+                shift
+                ;;
+            -e|--exclude)
+                EXCLUDE_PATTERNS+=("$2")
+                shift 2
+                ;;
+            -a|--age)
+                MAX_AGE_DAYS="$2"
+                if ! [[ "$MAX_AGE_DAYS" =~ ^[0-9]+$ ]]; then
+                    error_exit "Age must be a positive integer"
+                fi
+                shift 2
+                ;;
+            -*)
+                error_exit "Unknown option: $1\nUse --help for usage information"
+                ;;
+            *)
+                if [[ -z "$log_directory" ]]; then
+                    log_directory="$1"
+                    shift
+                else
+                    error_exit "Multiple directories specified\nUse --help for usage information"
+                fi
+                ;;
+        esac
+    done
+    
+    # Validate required arguments
+    if [[ -z "$log_directory" ]]; then
+        error_exit "Log directory not specified\nUse --help for usage information"
+    fi
+    
+    # Print banner
+    print_color "$GREEN" "========================================"
+    print_color "$GREEN" "  Log Archive Tool v${SCRIPT_VERSION}"
+    print_color "$GREEN" "========================================"
+    echo
+    
+    # Validate directories
+    validate_directory "$log_directory"
+    setup_archive_directory "$output_directory"
+    
+    # Create archive
+    info "Source directory: $log_directory"
+    info "Archive directory: $output_directory"
+    
+    if [[ "$DRY_RUN" == true ]]; then
+        warn "DRY RUN MODE - No files will be modified"
+    fi
+    
+    echo
+    
+    if create_archive "$log_directory" "$output_directory"; then
+        echo
+        success "Archiving completed successfully!"
+        info "Archive history: $LOG_FILE"
+    else
+        echo
+        warn "Archiving completed with warnings"
+    fi
+}
+
+# Run main function
+main "$@"
